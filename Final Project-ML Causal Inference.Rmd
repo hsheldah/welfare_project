@@ -1,0 +1,698 @@
+---
+title: "Machine Learning for Causal Inference Final Project"
+author: "Haviland Sheldahl-Thomason"
+date: "6/5/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(splitstackshape)
+library(olsrr)
+library(lfe)
+library(broom)
+library(ivpack)
+library(sandwich)
+library(stargazer)
+library(dplyr)
+library(MASS)
+library(bit64)
+library(ICSNP)
+library(plyr)
+library(grf)
+library(lme4)
+library(glmnet)
+library(kableExtra)
+library(ggplot2)
+library(cobalt)
+library(devtools)
+library(naniar)
+library(data.table)
+library(devtools)
+library(factoextra)
+library(ggbiplot)
+library(randomForest)
+library(nnet)
+library(neuralnet)
+library(evtree)
+library(gbm)
+library(xgboost)
+library(estimatr)
+library(caret)
+library(xgboost)
+```
+
+
+#Part 1: Describing the data, treatment, and outcome
+
+I chose to look at the average and heterogenous effects of the treatment using the welfare dataset provided by the course. The treatment for this experiment was exposure to a question asking the opinion of the recipient on 'welfare' or on 'assistance to the poor'.  Everything else on the form was the same. The outcome was whether the respondent stated that the government spent too much on welfare or assistance to the poor or not. 
+
+After cleaning the data, there are 13,198 observations, of which 6,787 are treated and 6,411 are control. Summary statistics of the covariates follow. 
+
+```{r, message=FALSE}
+#loading data
+df <- readr::read_csv(file = "https://raw.githubusercontent.com/gsbDBI/ExperimentData/master/Welfare/ProcessedData/welfarenolabel3.csv", na = character())
+# Specify outcome, treatment, and covariate variable names to use
+outcome_variable_name <- "y"
+treatment_variable_name <- "w"
+covariate_names <- c("partyid", "hrs1", "income", "rincome", "wrkstat", "wrkslf","age", "polviews",
+                       "educ", "earnrs", "race","wrkslf",
+                       "marital","sibs","childs", "occ80",  "prestg80", "indus80","res16","reg16","mobile16", "family16", "parborn","maeduc","degree","sex","race","born","hompop","babies","preteen","teens","adults")
+
+# Combine all names
+all_variables_names <- c(outcome_variable_name, treatment_variable_name, covariate_names)
+df <- df %>% dplyr::select(one_of(all_variables_names))
+#df <- df[, which(names(df) %in% all_variables_names)]
+#replacing -999 to NA in data
+df = na_if(df, -999)
+#dropping any row that has missing values:
+df <- na.omit(df)
+
+# Rename variables
+names(df)[names(df) == outcome_variable_name] <- "Y"
+names(df)[names(df) == treatment_variable_name] <- "W"
+df <- data.frame(lapply(df, function(x) as.numeric(as.character(x))))
+
+
+#Summary tables:
+stats <- list()
+pvec <- seq(0,1,0.1)
+stats_table= function (i) {
+  stats_var = as.data.frame(df[[i]])
+  colnames(stats_var) <- "var"
+  quantiles = quantile(stats_var$var, pvec, na.rm = T)
+  name_var <- paste('variable:',i,sep='')
+  stats[['var']] <-   colnames(df[[i]])
+  stats[['sd']] <-   sd(stats_var$var, na.rm = T)
+  stats[['mean']] <- mean(stats_var$var,  na.rm = T)
+  stats[['min']] <- min(stats_var$var, na.rm = T)
+  stats[['p10']] <- quantiles[2]
+  stats[['median']] <- median(stats_var$var, na.rm = T)
+  stats[['p90']] <- quantiles[10]
+  stats[['max']] <- max(stats_var$var, na.rm = T)
+  return(stats)
+}
+
+summ_stats = NULL
+for (i in 1:31){
+  stats_tables = as.data.frame(stats_table(i))
+  stats_tables$variable = NULL
+  stats_tables2 = cbind(variable = colnames(df[i]), stats_tables)
+  rownames(stats_tables2) <- c("")
+  summ_stats[[i]] = stats_tables2
+ # print(knitr::kable(stats_tables2, "markdown", digits = 6))
+}
+knitr::kable(summ_stats, "markdown", digits = 6)
+
+```
+
+#Part 2:  Examine variable importance
+
+The next step I took was to implement Principal Component Analysis, which is an unsupervised machine learning technique that helps researchers reduce the dimensionality of their data while preserving as much information as possible. While I have enough observations to estimate 31 features, I wanted to explore what variables might be important, and see if the results are similar from PCA and the variables of importance from a causal forest. 
+
+I also ran a causal forest on the train data, and looked at the variables that were most commonly used in tree splits.  Here, the top variables were political views, party id, education, and the industry in which they worked.  The variables that comprised the 2 main principal components were education, college degree, and prestige for the first component and  homogenous population, marital status, and earnings for the second component. (note that this was restricted only to continuous variables).  There is some overlap here, but not perfect, as the Principal Component method is used to explain the variance-covariance structure of a set of variables through linear combinations, and the causal forest method I used here reports the variables most often used in a tree split, which means that the greatest reduction in the mean squared error with regard to the outcomes Y is achieved using these variables.  As noted in the tutorial, this does not mean that variables with a low importance are not related to heterogeneity. 
+
+
+```{R, message=FALSE}
+#nstall_github("vqv/ggbiplot")
+#looking at cov of continuous variables:
+df = as.data.table(df)
+binary_covariates <- sapply(covariate_names,
+                              function(x) length(unique(df[[x]])) <= 2)
+cont_covariates = c("partyid" , "hrs1" ,  "income" ,  "rincome",  "age"  ,    "polviews" ,"educ"  ,   "earnrs",   "race" ,    "marital" , "sibs"  ,   "childs"  , "occ80"  ,  "prestg80" ,"indus80" , "res16"  ,  "reg16",    "mobile16" ,"family16", "parborn" , "maeduc"  , "degree",  "hompop" ,  "babies" ,  "preteen",  "teens",    "adults")  
+
+df_bin = covariate_names[binary_covariates]
+
+df = as.data.frame(df)
+df_bin <- df[df_bin]
+df_cont =  df[cont_covariates]
+df_cont$race.1 = NULL
+
+#Looking at continuous variables
+S  = cov(df_cont)
+sum(diag(S))
+# 134155.4
+s.eigen <- eigen(S)
+
+plot(s.eigen$values, xlab = 'Eigenvalue Number', ylab = 'Eigenvalue Size', main = 'Scree Graph')
+lines(s.eigen$values)
+
+#The first 2 principal components represent over 99% of the variance in the continuous variables
+#PCA with welfare data
+
+#Looking at variables that create these 2 principal components:
+
+#An eigenvalue > 1 indicates that PCs account for more variance than accounted by one of the original variables in standardized data. This is commonly used as a cutoff point for which PCs are retained. This holds true only when the data are standardized.
+welfare.pca <- prcomp(df_cont,  scale = TRUE)
+fviz_pca_var(welfare.pca, col.var = "black")
+
+#Positively correlated variables are grouped together.
+#Negatively correlated variables are positioned on opposite sides of the plot origin (opposed quadrants).
+#The distance between variables and the origin measures the quality of the variables on the factor map. Variables that are away from the origin are well represented on the factor map.
+#Variables that are closed to the center of the plot are less important for the first components.
+
+fviz_cos2(welfare.pca, choice = "var", axes = 1:2)
+var <- get_pca_var(welfare.pca)
+#The larger the value of the contribution, the more the variable contributes to the component.
+
+# Contributions of variables to PC1
+fviz_contrib(welfare.pca, choice = "var", axes = 1, top = 10)
+# Contributions of variables to PC2
+fviz_contrib(welfare.pca, choice = "var", axes = 2, top = 10)
+
+#Looking at varaible importance using causal forests
+#Splitting into test and train sets to use later
+id = sample(1:nrow(df),round(0.75*nrow(df)))
+df = as.data.table(df)
+df[id , split := 'train2']
+df[-id , split:= 'test2' ]
+train = as.data.frame(subset(df, split == "train2"))
+test = as.data.frame(subset(df, split == "test2"))
+
+df_cont<- sapply(df_cont,as.numeric)
+df_cont = as.data.frame(df_cont)
+df$Y = as.numeric(df$Y)
+df$W = as.numeric(df$W)
+cf <- causal_forest(
+  X = as.matrix(df_cont),
+  Y = df$Y,
+  W = df$W,
+  num.trees=2000) #Smaller number of trees for timing
+
+#Looking at how often a variable was used in the tree split (only continuous variables):
+var_imp <- c(variable_importance(cf))
+names(var_imp) <- cont_covariates
+sorted_var_imp <- sort(var_imp, decreasing=TRUE)
+sorted_var_imp = as.data.frame(sorted_var_imp)
+colnames(sorted_var_imp) <- "importance"
+kable(sorted_var_imp, "markdown", digits = 5, row.names = T)
+```
+
+#Part 3: ATE Methods
+
+After getting a better feel for the data, I then look at the average treatment effect.  I choose to compare the lasso, random forest, gradient boosted tree, and neural network methods to see which produced predictions that minimized the mean squared error in the data. I split the data into 75% train and 25% test sets, and used the predictions from the trained data to see which produced the most accurate results in the test data. 
+
+The method that I found was the best fit for this data was the Lasso method, which allows us to implement a regularizing term, or a penalty on complexity, which is found using cross validation.  This gave me an MSE of  0.1931273.
+
+The lasso method is one way of measuring the complexity of the model - in this case: what is the sum of the absolute values of all of the coefficients in the model? The lasso says this L1 norm has to be lower than a particular threshold, which is determined by cross-validation.
+Here we want to minimize the sum of the square of the differences subject to some function of our 31 betas, (|$\beta_1$| + |$\beta_2$| + ... +|$\beta_{31}| <=$ c), where we specify the c.
+
+```{r, message=FALSE}
+set.seed(1000)
+#ATE
+difference_in_means <- function(dataset) {
+  # Filter treatment / control observations, pulls outcome variable as a vector
+  y1 <- dataset %>% dplyr::filter(W == 1) %>% dplyr::pull(Y) # Outcome in treatment grp
+  y0 <- dataset %>% dplyr::filter(W == 0) %>% dplyr::pull(Y) # Outcome in control group
+  
+  n1 <- sum(dataset[,"W"])     # Number of obs in treatment
+  n0 <- sum(1 - dataset[,"W"]) # Number of obs in control
+  
+  # Difference in means is ATE
+  tauhat <- mean(y1) - mean(y0)
+  
+  # 95% Confidence intervals
+  se_hat <- sqrt( var(y0)/(n0-1) + var(y1)/(n1-1) )
+  lower_ci <- tauhat - 1.96 * se_hat
+  upper_ci <- tauhat + 1.96 * se_hat
+  return(c(ATE = tauhat, lower_ci = lower_ci, upper_ci = upper_ci))
+}
+##plotting function
+plotComp = function(yhat, y, label){
+  plot(yhat, y, las=1, xlab ='Predicted', ylab = 'Truth', main = label)
+  abline(0,1)
+}
+#mean squared errors function
+MSE = function(yhat, y){
+  mean((yhat-y)^2)
+}
+reg = Y ~  partyid + hrs1 + income + rincome + wrkstat + wrkslf + age + polviews + educ + earnrs +
+race+ wrkslf + marital + sibs + childs + occ80 + prestg80 + indus80 + res16 + reg16 + 
+mobile16 + family16 + parborn + maeduc + degree + sex + born + hompop + babies +
+preteen+ teens + adults 
+
+tauhat_rct_welfare <- difference_in_means(df)
+kable(tauhat_rct_welfare, "markdown", digits = 6, row.names = T)
+
+##Lasso method
+#here cv.glmnet  automatically performs a grid search to find 
+#the optimal penalty value, lambda
+xtrain <- as.matrix(train[, which(names(train) %in% covariate_names)])
+ytrain <- as.matrix(train[, which(names(train) %in% "Y")])
+
+xtest <- as.matrix(test[, which(names(test) %in% covariate_names)])
+ytest <- as.matrix(test[, which(names(test) %in% "Y")])
+
+lasso.cv = cv.glmnet(xtrain, ytrain, alpha = 1, nfolds = 10)
+#looking at selected lambda, this shows us the min is around -6.11084
+
+log(lasso.cv$lambda.min)
+yhat.test.lasso = predict(lasso.cv, xtest, s = 'lambda.min')
+
+plotComp(yhat.test.lasso, ytest,'Lasso')
+mse_lasso = as.data.frame(MSE(yhat.test.lasso, ytest))
+# 0.1931273
+
+#linear regression
+train$Y = as.factor(train$Y)
+model_glm <- caret::train(reg,
+                          data = train,
+                          method = "glm",
+                          family = "binomial",
+                          preProcess = c("scale", "center"),
+                          trControl = trainControl(method = "repeatedcv", 
+                                                  number = 5))
+
+yhat.test.glm  <- predict(model_glm, test)
+yhat.test.glm = as.double(yhat.test.glm)
+yhat.test.glm = yhat.test.glm -1
+mse_glm = as.data.frame(MSE(yhat.test.glm, ytest))
+# 0.2960606
+
+#Doing using random forest approach:
+xtrain = as.data.frame(xtrain)
+ytrain = as.data.frame(ytrain)
+#train = as.data.frame(ytrain)
+xtrain$Y = as.factor(ytrain$V1)
+rforest.cv = randomForest(reg, data = xtrain,
+                           nodesize = 5,
+                           mtry = 10,
+                           ntree = 500,
+                       replace = TRUE,
+                          tunecontrol = tune.control(cross = 5)) 
+xtest = as.data.frame(xtest)
+ytest = as.data.frame(ytest)
+yhat.forest = predict(rforest.cv, xtest, verbose = FALSE)
+yhat.forest = as.data.frame(yhat.forest)
+yhat.forest$pred = as.double(yhat.forest$yhat.forest)
+yhat.forest$pred2 = yhat.forest$pred - 1
+mse_forest = as.data.frame(MSE(yhat.forest$pred2, ytest$V1))
+# 0.2863636
+
+#Gradient boosted trees:
+train$Y = as.factor(train$Y)
+
+modelgb <- train(
+  reg, data = train, method = "xgbTree",
+  trControl = trainControl("cv", number = 10)
+  )
+# Best tuning parameter
+modelgb$bestTune
+
+predicted.classes <- modelgb %>% predict(test)
+# Compute model prediction accuracy rate
+mean(predicted.classes == test$Y)
+#0.7142424 - this model predicts classification correctly for around 71% of observations in the test data. 
+varimp = varImp(modelgb)
+varimp
+
+test$Y = as.double(test$Y)
+test$pred = as.double(unlist(predicted.classes))
+test$pred = test$pred - 1
+mse_gb = as.data.frame(MSE(test$pred, test$Y))
+# 0.2857576
+```
+
+For the neural network, I first normalize my data before I try and fit a neural network, as not doing so can more often lead to non-convergence. I use the min-max method to scale my data, after which I run a grid search with scaled train data to find the best fit for the scaled data. The grid search reveals that the best number of nodes for the hidden layer is 5.  I then choose to test 1 layer, for the sake of time (in my research I found that many people thought one layer was usually enough for most models, but ideally I would like to test more layers.)  
+
+```{r, message=FALSE}
+#using the approach of normalizing the data before training a neural network, as indicated here https://www.r-bloggers.com/fitting-a-neural-network-in-r-neuralnet-package/.
+df$split = NULL
+
+max2 = apply(df, 2, max) 
+min2 = apply(df, 2, min)
+scaled = as.data.frame(scale(df, center = min2, scale = max2 - min2))
+
+trainsc = scaled[id,]
+testsc = scaled[-id, ]
+
+#Code to running a grid search with scaled train data. 
+fitcontrol = trainControl(method = "repeatedcv", 
+                           number = 3, 
+                           repeats = 2)
+grid <- expand.grid(size=c(5,10), decay=c(.000001, .0001, .001))
+# train the mode
+trainsc$Y = as.factor(trainsc$Y)
+#If the target values are 0 or 1, you have a two-class classification problem
+#Model below shows which parameters are the best:
+model = capture.output(train(reg, data= trainsc, method = "nnet",
+        trControl = fitcontrol, tuneGrid = grid, linout = F))
+
+# The final values used for the model were size = 5 and decay = 1e-06. 
+
+#Running neural net with 1 layer and 5 nodes:
+nn_5 = neuralnet(reg,data=trainsc,
+                   hidden=c(5),
+                   stepmax = 1000000, 
+                   linear.output=F)
+#Now we can try to predict the test values and then 
+#calculate the MSE. The net will output a normalized 
+#prediction, it will need to be scaled back to accurately compare. 
+pr.nn5 = neuralnet::compute(nn_5, testsc[1:31])
+
+trainsc$Y = as.double(trainsc$Y)
+trainsc$Y = trainsc$Y - 1
+testsc$Y = as.double(testsc$Y)
+
+pr.nn5_unsc = pr.nn5$net.result*(max(trainsc$Y)-min(trainsc$Y))
+             + min(trainsc$Y)
+
+test.r = (testsc$Y)*(max(trainsc$Y)-min(trainsc$Y))+min(trainsc$Y)
+mse_nn = as.data.frame(MSE(test.r, pr.nn5_unsc))
+# 0.4109521
+#higher MSE than lasso method - data might not have many nonlinearities.
+
+#visual representation
+plot(nn_5)
+
+#Put table comparing MSEs here:
+mse_comp = cbind(mse_glm, mse_lasso, mse_forest,mse_gb,  mse_nn)
+colnames(mse_comp )= c("MSE GLM", "MSE Lasso", "MSE Random Forest", "MSE Gradient Boosted Tree", "MSE Neural Network")
+kable(mse_comp, "markdown", digits = 5)
+```
+
+#Part 4: HTE analysis
+
+For heterogeneous treatment effects, I looked at the output created by a linear regression and AIPW for 5 strata, where the data are divided based on propensity scores intially and then by CATE. Since treatment effects may vary widely between different subgroups in the population, it is important to explore these for policy reasons. In this case, the wording of the welfare question might sway one to support government support for those with less income or not to.  If the goal is to garner more support for the lower-income, the wording might very well cause a significant change in the number of supportive responses. 
+
+```{r, message=FALSE}
+#Part 1:  Dividing based on propensity score
+#  A common approach is to divide subjects into five equal-size groups using the quintiles of the estimated propensity score. 
+df <- readr::read_csv(file = "https://raw.githubusercontent.com/gsbDBI/ExperimentData/master/Welfare/ProcessedData/welfarenolabel3.csv", na = character())
+# Specify outcome, treatment, and covariate variable names to use
+outcome_variable_name <- "y"
+treatment_variable_name <- "w"
+covariate_names <- c("partyid", "hrs1", "income", "rincome", "wrkstat", "wrkslf","age", "polviews",
+                       "educ", "earnrs", "race","wrkslf",
+                       "marital","sibs","childs", "occ80",  "prestg80", "indus80","res16","reg16","mobile16", "family16", "parborn","maeduc","degree","sex","race","born","hompop","babies","preteen","teens","adults")
+
+# Combine all names
+all_variables_names <- c(outcome_variable_name, treatment_variable_name, covariate_names)
+df <- df %>% dplyr::select(one_of(all_variables_names))
+#df <- df[, which(names(df) %in% all_variables_names)]
+#replacing -999 to NA in data
+df = na_if(df, -999)
+#dropping any row that has missing values:
+df <- na.omit(df)
+names(df)[names(df) == outcome_variable_name] <- "Y"
+names(df)[names(df) == treatment_variable_name] <- "W"
+df <- data.frame(lapply(df, function(x) as.numeric(as.character(x))))
+
+#dividing into 5 groups, based on the quintiles of the treated individuals
+propval = glm(W ~ partyid + hrs1 + income + rincome + wrkstat + wrkslf + age + 
+    polviews + educ + earnrs + race  + marital + sibs + 
+    childs + occ80 + prestg80 + indus80 + res16 + reg16 + mobile16 + 
+    family16 + parborn + maeduc + degree + sex +  born + 
+    hompop + babies + preteen + teens + adults, data = df, family=binomial())
+coefs = data.frame(matrix(NA, nrow = 1, ncol = 32))
+coefs[1,] = propval$coefficients
+df$prscore = predict(propval, type = "response")
+
+y = subset(df, W == 1, select = prscore)
+
+qq = quantile(y$prscore, probs = seq(0, 1, .2))
+
+df$strata[df$prscore >= 0 & df$prscore < qq[2] ] = 1
+df$strata[df$prscore >=qq[2] & df$prscore < qq[3] ]<- 2
+df$strata[df$prscore >= qq[3] & df$prscore < qq[4]] <- 3
+df$strata[df$prscore >= qq[4] & df$prscore < qq[5] ]<- 4
+df$strata[df$prscore >= qq[5] & df$prscore <= 1 ]<- 5
+
+#ATE for each group
+difference_in_means <- function(dataset, quintile) {
+  dataset = subset(dataset, strata == quintile)
+  # Filter treatment / control observations, pulls outcome variable as a vector
+  y1 <- dataset %>% dplyr::filter(W == 1) %>% dplyr::pull(Y) # Outcome in treatment grp
+  y0 <- dataset %>% dplyr::filter(W == 0) %>% dplyr::pull(Y) # Outcome in control group
+  n1 <- sum(dataset[,"W"])     # Number of obs in treatment
+  n0 <- sum(1 - dataset[,"W"]) # Number of obs in control
+  # Difference in means is ATE
+  tauhat <- mean(y1) - mean(y0)
+  # 95% Confidence intervals
+  se_hat <- sqrt( var(y0)/(n0-1) + var(y1)/(n1-1) )
+  lower_ci <- tauhat - 1.96 * se_hat
+  upper_ci <- tauhat + 1.96 * se_hat
+  return(c(ATE = tauhat, lower_ci = lower_ci, upper_ci = upper_ci))
+}
+ate1 = difference_in_means(df,  1)
+ate2 = difference_in_means(df, 2)
+ate3 = difference_in_means(df, 3)
+ate4 = difference_in_means(df, 4)
+ate5 = difference_in_means(df, 5)
+
+real_ates = rbind(ate1, ate2, ate3, ate4, ate5)
+quintile <- c(1,  2,  3,  4, 5)
+real_ates <- cbind(quintile, real_ates)
+kable(real_ates, "markdown", digits = 4, row.names = T)
+
+#estimating average effect using linear regression for each stratum:
+ate = list()
+eststo = list()
+df = as.data.table(df)
+for (i in (1:5)){
+  sub = subset(df, strata == i)
+  results = lm_robust(reg, data = sub)
+  sub$predlm0 = predict(lm(reg, sub[W==0]), sub)
+  sub$predlm1 = predict(lm(reg, sub[W==1]), sub)
+  avg = mean(sub$predlm1 - sub$predlm0)
+  eststo[[i]] = results$coefficients
+  ate[[i]] = avg
+}
+ate = as.data.table(ate)
+colnames(ate) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+#AIPW
+#Need to rerun cf first:
+X2 = dplyr::select(df, covariate_names)
+X2 <- data.frame(lapply(X2, function(x) as.numeric(as.character(x))))
+cf <- causal_forest(
+  X = as.matrix(X2),
+  Y = df$Y,
+  W = df$W,
+  num.trees=2000)
+
+estimated_aipw_ate <- lapply(
+  seq(5), function(w) {
+  ate <- average_treatment_effect(cf, subset = df$strata == w)
+})
+estimated_aipw_ate <- data.frame(do.call(rbind, estimated_aipw_ate))
+
+estimates_aipw = as.data.frame(estimated_aipw_ate[,1])
+estimates_aipw = t(estimates_aipw)
+estimates_aipw = as.data.frame(estimates_aipw)
+colnames(estimates_aipw) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+real_ate = as.data.frame(real_ates[,2])
+real_ate = t(real_ate)
+real_ate = as.data.frame(real_ate)
+colnames(real_ate) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+#Comparing the 2 sets of estimates with the real ATE per stratum:
+compare = rbind(real_ate, ate, estimates_aipw)
+row.names(compare) = c("True ate", "OLS ate", "AIPW ate")
+kable(compare, "markdown", digits = 5)
+#The AIPW estimate gets the closest to the true value, but both are quite close. 
+
+#Part 2:  Dividing based on CATE 
+oob_pred <- predict(cf, estimate.variance=TRUE)
+oob_tauhat_cf <- oob_pred$predictions
+df$cate <- oob_tauhat_cf
+df$strata <- factor(ntile(oob_tauhat_cf, n=5))
+
+ate1_cate = difference_in_means(df,  1)
+ate2_cate = difference_in_means(df, 2)
+ate3_cate = difference_in_means(df, 3)
+ate4_cate = difference_in_means(df, 4)
+ate5_cate = difference_in_means(df, 5)
+
+real_ates_cate = rbind(ate1_cate, ate2_cate, ate3_cate, ate4_cate, ate5_cate)
+real_ates_cate <- cbind(quintile, real_ates_cate)
+kable(real_ates_cate, "markdown", digits = 4, row.names = T)
+
+#estimating average effect using linear regression for each stratum:
+ate_cate = list()
+df = as.data.table(df)
+for (i in (1:5)){
+  sub = subset(df, strata == i)
+  results = lm_robust(reg, data = sub)
+  sub$predlm0 = predict(lm(reg, sub[W==0]), sub)
+  sub$predlm1 = predict(lm(reg, sub[W==1]), sub)
+  avg = mean(sub$predlm1 - sub$predlm0)
+  ate_cate[[i]] = avg
+}
+ate_cate = as.data.table(ate_cate)
+colnames(ate_cate) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+#AIPW
+estimated_aipw_cate<- lapply(
+  seq(5), function(w) {
+  ate <- average_treatment_effect(cf, subset = df$strata == w)
+})
+estimated_aipw_cate <- data.frame(do.call(rbind, estimated_aipw_cate))
+
+estimates_aipw_cate = as.data.frame(estimated_aipw_cate[,1])
+estimates_aipw_cate = t(estimates_aipw_cate)
+estimates_aipw_cate = as.data.frame(estimates_aipw_cate)
+colnames(estimates_aipw_cate) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+real_cate = as.data.frame(real_ates_cate[,2])
+real_cate = t(real_cate)
+real_cate = as.data.frame(real_cate)
+colnames(real_cate) = c( "Stratum 1", "Stratum 2", "Stratum 3", "Stratum 4", "Stratum 5")
+
+#Comparing the 2 sets of estimates with the real ATE per stratum:
+compare_cate = rbind(real_cate, ate_cate, estimates_aipw_cate)
+row.names(compare_cate) = c("True ate", "OLS ate", "AIPW ate")
+kable(compare_cate, "markdown", digits = 5)
+```
+  
+#Part 5: Evaluating Policies.
+
+In the hte tutorial, it is mentioned that doubly robust scores can be used to evaluate policies for both RCTs and observational data.  Here, I apply this method to determine which policy allocation is the best for the welfare dataset. 
+
+```{r, message=FALSE}
+#Following tutorial code here
+n <- dim(df)[1]
+random_idx <- sample.int(n, size=floor(n/2), replace=F)
+df_train <- df[random_idx,]
+df_test <- df[-random_idx,]
+
+# Estimating E[Y|X=x]
+Y.forest <- regression_forest(df_train[,..covariate_names], df_train$Y)
+Y.hat <- predict(Y.forest)$predictions # OOB predictions!
+
+# Estimating E[W|X=x]
+W.forest <- regression_forest(df_train[,..covariate_names], df_train$W)
+W.hat <- predict(W.forest)$predictions # OOB predictions!
+
+# Estimation of E[Y(1) - Y(0)|X=x] 
+tau.forest <- causal_forest(df_train[,..covariate_names], df_train$Y, df_train$W, Y.hat = Y.hat, W.hat = W.hat)
+tau.hat.train <- predict(tau.forest)$predictions # OOB predictions!
+tau.hat.test <- predict(tau.forest, newdata=df_test[,..covariate_names])$predictions
+
+# Estimating E[Y|X=x, W=0] and E[Y|X=x, W=1]
+mu.hat.0 <- Y.hat - W.hat * tau.hat.train
+mu.hat.1 <- Y.hat + (1 - W.hat) * tau.hat.train
+
+# Computing doubly-robust scores
+resid <- df_train$Y - df_train$W * mu.hat.1 - (1 - df_train$W) * mu.hat.0
+weights <- (df_train$W - W.hat) / (W.hat * (1 - W.hat))
+Gamma.hat.train <- tau.hat.train + weights * resid
+
+cost <- median(tau.hat.train)
+Gamma.hat.train.net <- Gamma.hat.train - cost
+
+#Doing for the test set:
+# Predicting E[Y|X=x] on test set
+Y.hat.test <- predict(Y.forest, newdata=df_test[,..covariate_names])$predictions
+# Predicting E[W|X=x] on test set
+W.hat.test <- predict(W.forest, newdata=df_test[,..covariate_names])$predictions
+
+# Predicting E[Y|X=x, W=0] and E[Y|X=x, W=1]
+mu.hat.0.test <- Y.hat.test - W.hat.test * tau.hat.test
+mu.hat.1.test <- Y.hat.test + (1 - W.hat.test) * tau.hat.test
+
+# Computing doubly-robust scores
+resid.test <- df_test$Y - df_test$W * mu.hat.1.test - (1 - df_test$W) * mu.hat.0.test
+weights.test <- (df_test$W - W.hat.test) / (W.hat.test * (1 - W.hat.test))
+
+Gamma.hat.test <- tau.hat.test + weights.test * resid.test
+Gamma.hat.test.net <- Gamma.hat.test - cost
+
+#Estimating improvement over random policy:
+
+# Plug-in policy assignments
+plugin.assignment.train <- 2*as.numeric(tau.hat.train > cost) - 1
+plugin.assignment.test <- 2*as.numeric(tau.hat.test > cost) - 1
+
+A.pi.train <- plugin.assignment.train*Gamma.hat.train.net
+A.pi.test <- plugin.assignment.test*Gamma.hat.test.net
+
+A.pi.train = as.data.frame(A.pi.train)
+A.pi.train$var = as.double(A.pi.train$A.pi.train)
+
+A.pi.test = as.data.frame(A.pi.test)
+A.pi.test$var = as.double(A.pi.test$A.pi.test)
+
+plugin.perf.train = NULL
+plugin.perf.train$mean = mean(A.pi.train$var)
+plugin.perf.train$se = sd(A.pi.train$var, na.rm=TRUE) /  sqrt(length(A.pi.train$var[!is.na(A.pi.train$var)])) 
+
+plugin.perf.test = NULL
+plugin.perf.test$mean = mean(A.pi.test$var)
+plugin.perf.test$se = sd(A.pi.test$var, na.rm=TRUE) /  sqrt(length(A.pi.test$var[!is.na(A.pi.test$var)])) 
+
+dr.plugin.A.hat <- data.frame(
+  rbind("Plug-in Performance - Train" = plugin.perf.train,
+        "Plug-in Performance - Test" = plugin.perf.test))
+
+dr.plugin.A.hat<- sapply(dr.plugin.A.hat, as.numeric)
+dr.plugin.A.hat = as.data.frame(dr.plugin.A.hat)
+
+dr.plugin.A.hat$lower.ci <- dr.plugin.A.hat$mean - (1.96 * dr.plugin.A.hat$se)
+dr.plugin.A.hat$upper.ci <- dr.plugin.A.hat$mean+ (1.96 * dr.plugin.A.hat$se)
+
+#Benefit of plug i nnversus random policy is:
+colnames(dr.plugin.A.hat) <- c("A.hat", "SE", "Lower CI", "Upper CI")
+rownames(dr.plugin.A.hat) <- c("Train", "Test")
+kable(dr.plugin.A.hat, "markdown", digits = 5, row.names = T)
+
+#finding benefit of optimal policy
+
+# Create new dataframe
+df_aug <- df_train
+
+# Add sign of gamma (denoted Z) and absolute value of gamma (denoted lambda)
+df_aug$label <- factor(sign(Gamma.hat.train.net))
+df_aug$weights <- abs(Gamma.hat.train.net)
+
+fmla <- as.formula(paste0("label ~ ", paste0(covariate_names, collapse = " + ")))
+
+opt_policy_tree <- evtree::evtree(formula = fmla, 
+                                  data = df_aug,
+                                  control=evtree.control(maxdepth=3,
+                                                         minbucket=0.025*100*sum(df_aug$weights),
+                                                         minsplit=0.075*100*sum(df_aug$weights),
+                                                         niterations=1000,
+                                                         ntrees=100),
+                                  weights=round(100*df_aug$weights))
+
+s <- capture.output(print(opt_policy_tree))
+str <- sapply(s[9:length(s)], function(x) gsub("\\(n = [0-9A-Za-z].*", "", x))
+cat(paste(str, collapse="\n"))
+
+# Predict optimal assignment
+opt.tree.assignment.train <- as.numeric(as.character(predict(opt_policy_tree, newdata = df_train, type="response")))
+opt.tree.assignment.test <- as.numeric(as.character(predict(opt_policy_tree, newdata = df_test, type="response")))
+
+# Calculate value over random policy
+opt1 = opt.tree.assignment.train*Gamma.hat.train.net
+opt1_df = NULL
+opt1_df$mean = mean(opt1)
+opt1_df$se= sd(opt1)/sqrt(length(opt1))
+
+opt_test = opt.tree.assignment.test*Gamma.hat.test.net
+opt_test_df = NULL
+opt_test_df$mean = mean(opt_test)
+opt_test_df$se= sd(opt_test)/sqrt(length(opt_test))
+
+opt.tree.A.hat <- data.frame(rbind(
+  "Optimal Tree Performance - Train" = opt1_df, 
+  "Optimal Tree Performance - Test"  = opt_test_df))
+
+opt.tree.A.hat<- sapply(opt.tree.A.hat, as.numeric)
+opt.tree.A.hat = as.data.frame(opt.tree.A.hat)
+
+opt.tree.A.hat$lower.ci <- opt.tree.A.hat$mean -(1.96 * opt.tree.A.hat$se)
+opt.tree.A.hat$upper.ci <- opt.tree.A.hat$mean + (1.96 * opt.tree.A.hat$se)
+colnames(opt.tree.A.hat) <- c("A.hat", "SE", "Lower CI", "Upper CI")
+rownames(opt.tree.A.hat) <- c("Train", "Test")
+
+kable(opt.tree.A.hat, "markdown", digits = 5, 
+        caption="Doubly robust estimated benefit of optimal tree policy vs random policy", row.names = T)
+
+#  footnote(general = paste0("<i>Important</i>: This policy was fit on the training set,<br>",
+ #                           "so the training sample estimate may be biased upwards."), 
+```
+
